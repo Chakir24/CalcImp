@@ -68,6 +68,7 @@ type FormState = {
   cppContrib: string;
   eiPremium: string;
   rrqQpipContrib: string;
+  rqapContrib: string;
   rrsp: string;
   otherDeductions: string;
   otherCredits: string;
@@ -80,13 +81,14 @@ type AssistanceProfile = "salarie" | "etudiant" | "autonome" | "mixte";
 const defaultState: FormState = {
   taxYear: "2025",
   province: "qc",
-  employmentIncome: "60000",
+  employmentIncome: "0",
   otherIncome: "0",
-  incomeTaxDeducted: "6000",
-  quebecIncomeTaxDeducted: "4500",
-  cppContrib: "3200",
-  eiPremium: "900",
-  rrqQpipContrib: "2600",
+  incomeTaxDeducted: "0",
+  quebecIncomeTaxDeducted: "0",
+  cppContrib: "0",
+  eiPremium: "0",
+  rrqQpipContrib: "0",
+  rqapContrib: "0",
   rrsp: "0",
   otherDeductions: "0",
   otherCredits: "0",
@@ -156,6 +158,11 @@ const normalizeNumber = (value: string) => {
   const lastDot = cleaned.lastIndexOf(".");
   let normalized = cleaned;
 
+  const splitCentsMatch = value.match(/(\d{1,3})\s+(\d{2})\b/);
+  if (splitCentsMatch) {
+    return `${splitCentsMatch[1]}.${splitCentsMatch[2]}`;
+  }
+
   if (lastComma !== -1 && lastDot !== -1) {
     if (lastComma > lastDot) {
       normalized = cleaned.replace(/\./g, "").replace(",", ".");
@@ -173,7 +180,7 @@ const normalizeNumber = (value: string) => {
 
 const stripLeadingBoxNumber = (value: string) =>
   value.replace(
-    /^\s*(?:case|boite|box|rl-1|rl 1|releve 1|releve)?\s*(?:14|16|17|18|22|B|E)\s*[:\-]?\s*/i,
+    /^\s*(?:case|boite|box|rl-1|rl 1|releve 1|releve)?\s*(?:10|14|16|17|18|22|B|E)\s*[:\-]?\s*/i,
     ""
   );
 
@@ -197,51 +204,208 @@ const matchFirstNumber = (text: string, patterns: RegExp[]) => {
   return undefined;
 };
 
+const matchSplitCents = (text: string, patterns: RegExp[]) => {
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1] && match?.[2]) {
+      return `${match[1]}.${match[2]}`;
+    }
+  }
+  return undefined;
+};
+
+const extractNumberFromFragment = (fragment: string) => {
+  const splitCents = fragment.match(/(\d[\d ]*)\s+(\d{2})\b/);
+  if (splitCents?.[1] && splitCents?.[2]) {
+    return extractNumber(`${splitCents[1]} ${splitCents[2]}`);
+  }
+
+  const decimal = fragment.match(/(\d[\d ]*)[,.](\d{2})\b/);
+  if (decimal?.[1] && decimal?.[2]) {
+    return extractNumber(`${decimal[1]}.${decimal[2]}`);
+  }
+
+  const integer = fragment.match(/(\d[\d ]*)/);
+  if (integer?.[1]) {
+    return extractNumber(integer[1]);
+  }
+
+  return undefined;
+};
+
+const matchNumberAfterLabel = (text: string, labels: string[]) => {
+  for (const label of labels) {
+    const pattern = new RegExp(
+      `${label}[\\s\\S]{0,30}?(\\d+\\s+\\d{2}|\\d[\\d\\s,.$]*)`
+    );
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      return extractNumber(match[1]);
+    }
+  }
+  return undefined;
+};
+
+const isNumericLine = (line: string) =>
+  /^[\d\s,.\-$]+$/.test(line.trim());
+
+const matchNumberInLines = (text: string, labels: string[]) => {
+  const lines = text.split(/\r?\n/).map((line) => line.trim());
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const label = labels.find((item) => line.includes(item));
+    if (!label) {
+      continue;
+    }
+    const afterLabel = line.slice(line.indexOf(label) + label.length);
+    const fromSameLine = extractNumberFromFragment(afterLabel);
+    if (fromSameLine) {
+      return fromSameLine;
+    }
+    const nextLine = lines[i + 1];
+    if (nextLine && isNumericLine(nextLine)) {
+      const fromNextLine = extractNumberFromFragment(nextLine);
+      if (fromNextLine) {
+        return fromNextLine;
+      }
+    }
+  }
+  return undefined;
+};
+
+const matchRl1CaseValue = (
+  text: string,
+  code: string,
+  labels: string[]
+) => {
+  const lines = text.split(/\r?\n/).map((line) => line.trim());
+  const codePattern = code.replace(".", "\\.");
+  const labelPatterns = labels.map((label) => ({
+    raw: label,
+    regex: new RegExp(
+      `^\\s*${codePattern}\\s*[-–—]?\\s*${label}\\b`,
+      ""
+    ),
+  }));
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const normalizedLine = line.replace(/\s+/g, " ").replace(/[–—]/g, "-");
+    const pattern = labelPatterns.find(({ regex }) =>
+      regex.test(normalizedLine)
+    );
+    if (!pattern) {
+      continue;
+    }
+    const afterLabel = normalizedLine
+      .replace(pattern.regex, "")
+      .trim();
+    const fromSameLine = extractNumberFromFragment(afterLabel);
+    if (fromSameLine) {
+      return fromSameLine;
+    }
+    const nextLine = lines[i + 1];
+    if (nextLine && isNumericLine(nextLine)) {
+      return extractNumberFromFragment(nextLine);
+    }
+    return undefined;
+  }
+
+  return undefined;
+};
+
 const parsePdfText = (text: string) => {
   const normalized = text.replace(/\u00a0/g, " ");
   const taxYearMatch = normalized.match(/(20\d{2})/);
+  const hasQuebecContext = /(?:Releve|RELEVE|Relevé|RELEVÉ|RL-1|RL 1|Quebec|Québec|RQ|RRQ|QPIP)/.test(
+    normalized
+  );
+
+  const rl1EmploymentIncome = hasQuebecContext
+    ? matchRl1CaseValue(normalized, "A", [
+        "Revenus d'emploi",
+        "Revenus d emploi",
+      ])
+    : undefined;
+  const rl1Rrq = hasQuebecContext
+    ? matchRl1CaseValue(normalized, "B.A", [
+        "Cotisation au RRQ",
+        "Cotisation au RRO",
+      ])
+    : undefined;
+  const rl1Ei = hasQuebecContext
+    ? matchRl1CaseValue(normalized, "C", [
+        "Cotisation à l'assurance emploi",
+        "Cotisation a l'assurance emploi",
+        "Cotisation a l assurance emploi",
+      ])
+    : undefined;
+  const rl1QuebecTax = hasQuebecContext
+    ? matchRl1CaseValue(normalized, "E", [
+        "Impôt du Québec retenu",
+        "Impot du Quebec retenu",
+      ])
+    : undefined;
+  const rl1Rqap = hasQuebecContext
+    ? matchRl1CaseValue(normalized, "H", [
+        "Cotisation au RQAP",
+        "Cotisation au QPIP",
+      ])
+    : undefined;
 
   return {
     taxYear: taxYearMatch?.[1],
-    employmentIncome: matchFirstNumber(normalized, [
-      /(?:Box|Case|Boite)\s*14[^\d]*([\d\s,.\$]+)/i,
-      /(?:^|\n)\s*14\s*[:\-]?\s*([\d\s,.\$]+)/im,
-      /Employment income[^\d]*([\d\s,.\$]+)/i,
-      /Revenu d'emploi[^\d]*([\d\s,.\$]+)/i,
-    ]),
+    employmentIncome:
+      matchFirstNumber(normalized, [
+        /(?:Box|Case|Boite)\s*14[^\d]*([\d\s,.\$]+)/,
+        /(?:^|\n)\s*14\s*[:\-]?\s*([\d\s,.\$]+)/m,
+        /Employment income[^\d]*([\d\s,.\$]+)/,
+        /Revenu d'emploi[^\d]*([\d\s,.\$]+)/,
+      ]) ?? rl1EmploymentIncome,
     incomeTaxDeducted: matchFirstNumber(normalized, [
-      /(?:Box|Case|Boite)\s*22[^\d]*([\d\s,.\$]+)/i,
-      /(?:^|\n)\s*22\s*[:\-]?\s*([\d\s,.\$]+)/im,
-      /Income tax deducted[^\d]*([\d\s,.\$]+)/i,
-      /Impot sur le revenu[^\d]*([\d\s,.\$]+)/i,
+      /(?:Box|Case|Boite)\s*22[^\d]*([\d\s,.\$]+)/,
+      /(?:^|\n)\s*22\s*[:\-]?\s*([\d\s,.\$]+)/m,
+      /Income tax deducted[^\d]*([\d\s,.\$]+)/,
+      /Impot sur le revenu[^\d]*([\d\s,.\$]+)/,
     ]),
     cppContrib: matchFirstNumber(normalized, [
-      /(?:Box|Case|Boite)\s*16[^\d]*([\d\s,.\$]+)/i,
-      /(?:^|\n)\s*16\s*[:\-]?\s*([\d\s,.\$]+)/im,
-      /CPP contributions[^\d]*([\d\s,.\$]+)/i,
-      /Cotisations RPC[^\d]*([\d\s,.\$]+)/i,
+      /(?:Box|Case|Boite)\s*16[^\d]*([\d\s,.\$]+)/,
+      /(?:^|\n)\s*16\s*[:\-]?\s*([\d\s,.\$]+)/m,
+      /CPP contributions[^\d]*([\d\s,.\$]+)/,
+      /Cotisations RPC[^\d]*([\d\s,.\$]+)/,
     ]),
-    eiPremium: matchFirstNumber(normalized, [
-      /(?:Box|Case|Boite)\s*18[^\d]*([\d\s,.\$]+)/i,
-      /(?:^|\n)\s*18\s*[:\-]?\s*([\d\s,.\$]+)/im,
-      /EI premiums[^\d]*([\d\s,.\$]+)/i,
-      /Assurance-emploi[^\d]*([\d\s,.\$]+)/i,
-    ]),
-    quebecIncomeTaxDeducted: matchFirstNumber(normalized, [
-      /(?:Releve|RL-1|RL 1)[^\d]*(?:Case|Boite)?\s*E[^\d]*([\d\s,.\$]+)/i,
-      /(?:^|\n)\s*E\s*[:\-]?\s*([\d\s,.\$]+)/im,
-      /Quebec income tax[^\d]*([\d\s,.\$]+)/i,
-      /Impot du Quebec[^\d]*([\d\s,.\$]+)/i,
-    ]),
-    rrqQpipContrib: matchFirstNumber(normalized, [
-      /(?:Releve|RL-1|RL 1)[^\d]*(?:Case|Boite)?\s*B[^\d]*([\d\s,.\$]+)/i,
-      /(?:^|\n)\s*B\s*[:\-]?\s*([\d\s,.\$]+)/im,
-      /(?:Box|Case|Boite)\s*17[^\d]*([\d\s,.\$]+)/i,
-      /(?:^|\n)\s*17\s*[:\-]?\s*([\d\s,.\$]+)/im,
-      /QPP contributions[^\d]*([\d\s,.\$]+)/i,
-      /Cotisations RRQ[^\d]*([\d\s,.\$]+)/i,
-      /QPIP[^\d]*([\d\s,.\$]+)/i,
-    ]),
+    eiPremium:
+      matchFirstNumber(normalized, [
+        /(?:Box|Case|Boite)\s*18[^\d]*([\d\s,.\$]+)/,
+        /(?:^|\n)\s*18\s*[:\-]?\s*([\d\s,.\$]+)/m,
+        /EI premiums[^\d]*([\d\s,.\$]+)/,
+        /Assurance-emploi[^\d]*([\d\s,.\$]+)/,
+      ]) ?? rl1Ei,
+    quebecIncomeTaxDeducted: hasQuebecContext
+      ? rl1QuebecTax
+      : undefined,
+    rrqQpipContrib: hasQuebecContext
+      ? matchFirstNumber(normalized, [
+          /(?:Releve|RL-1|RL 1)[^\d]*(?:Case|Boite)?\s*B[^\d]*([\d\s,.\$]+)/,
+          /QPP contributions[^\d]*([\d\s,.\$]+)/,
+          /Cotisations RRQ[^\d]*([\d\s,.\$]+)/,
+          /RRQ[^\d]*([\d\s,.\$]+)/,
+        ]) ?? rl1Rrq
+      : undefined,
+    rqapContrib: hasQuebecContext
+      ? matchSplitCents(normalized, [
+          /(?:Releve|RL-1|RL 1)[^\d]*(?:Case|Boite)?\s*10[^\d]*(\d+)\s+(\d{2})/,
+          /RQAP[^\d]*(\d+)\s+(\d{2})/,
+          /QPIP[^\d]*(\d+)\s+(\d{2})/,
+          /Parental insurance[^\d]*(\d+)\s+(\d{2})/,
+        ]) ??
+        matchFirstNumber(normalized, [
+          /(?:Releve|RL-1|RL 1)[^\d]*(?:Case|Boite)?\s*10[^\d]*([\d\s,.\$]+)/,
+          /RQAP[^\d]*([\d\s,.\$]+)/,
+          /QPIP[^\d]*([\d\s,.\$]+)/,
+          /Parental insurance[^\d]*([\d\s,.\$]+)/,
+        ]) ?? rl1Rqap
+      : undefined,
   };
 };
 
@@ -327,6 +491,7 @@ const calculateTax = (state: FormState) => {
   const eiPremium = toNumber(state.eiPremium);
   const otherCredits = toNumber(state.otherCredits);
   const rrqQpipContrib = toNumber(state.rrqQpipContrib);
+  const rqapContrib = toNumber(state.rqapContrib);
   const otherQuebecCredits = toNumber(state.otherQuebecCredits);
   const includeBPA = state.includeBPA;
   const isQuebec = state.province === "qc";
@@ -350,7 +515,7 @@ const calculateTax = (state: FormState) => {
     ? taxData.quebecBpa * taxData.quebecCreditRate
     : 0;
   const quebecPayrollCredits =
-    rrqQpipContrib * taxData.quebecCreditRate;
+    (rrqQpipContrib + rqapContrib) * taxData.quebecCreditRate;
   const quebecCredits = Math.max(
     0,
     quebecBpaCredit + quebecPayrollCredits + otherQuebecCredits
@@ -387,6 +552,10 @@ const calculateTax = (state: FormState) => {
 export default function Home() {
   const [form, setForm] = useState<FormState>(defaultState);
   const [importStatus, setImportStatus] = useState<string | null>(null);
+  const [importPreviewText, setImportPreviewText] = useState<string | null>(null);
+  const [importQuebecTax, setImportQuebecTax] = useState<string | null>(null);
+  const [showImportText, setShowImportText] = useState(false);
+  const [calculateError, setCalculateError] = useState<string | null>(null);
   const [assistanceProfile, setAssistanceProfile] =
     useState<AssistanceProfile>("salarie");
   const [completedSteps, setCompletedSteps] = useState<Record<string, boolean>>(
@@ -480,18 +649,18 @@ export default function Home() {
 
       const text = await extractPdfText(pdf);
       const parsed = parsePdfText(text);
+      setImportPreviewText(text);
+      setImportQuebecTax(parsed.quebecIncomeTaxDeducted ?? null);
       setForm((prev) => ({
         ...prev,
         taxYear: parsed.taxYear ?? prev.taxYear,
-        province: prev.province === "other" ? "qc" : prev.province,
-        employmentIncome: parsed.employmentIncome ?? prev.employmentIncome,
-        incomeTaxDeducted:
-          parsed.incomeTaxDeducted ?? prev.incomeTaxDeducted,
-        cppContrib: parsed.cppContrib ?? prev.cppContrib,
-        eiPremium: parsed.eiPremium ?? prev.eiPremium,
-        quebecIncomeTaxDeducted:
-          parsed.quebecIncomeTaxDeducted ?? prev.quebecIncomeTaxDeducted,
-        rrqQpipContrib: parsed.rrqQpipContrib ?? prev.rrqQpipContrib,
+        employmentIncome: parsed.employmentIncome ?? "0",
+        incomeTaxDeducted: parsed.incomeTaxDeducted ?? "0",
+        cppContrib: parsed.cppContrib ?? "0",
+        eiPremium: parsed.eiPremium ?? "0",
+        quebecIncomeTaxDeducted: parsed.quebecIncomeTaxDeducted ?? "",
+        rrqQpipContrib: parsed.rrqQpipContrib ?? "0",
+        rqapContrib: parsed.rqapContrib ?? "0",
       }));
       setImportStatus("Import PDF termine. Verifiez les champs detectes.");
     } catch (error) {
@@ -523,18 +692,18 @@ export default function Home() {
 
       const text = await extractPdfTextWithOcr(pdf);
       const parsed = parsePdfText(text);
+      setImportPreviewText(text);
+      setImportQuebecTax(parsed.quebecIncomeTaxDeducted ?? null);
       setForm((prev) => ({
         ...prev,
         taxYear: parsed.taxYear ?? prev.taxYear,
-        province: prev.province === "other" ? "qc" : prev.province,
-        employmentIncome: parsed.employmentIncome ?? prev.employmentIncome,
-        incomeTaxDeducted:
-          parsed.incomeTaxDeducted ?? prev.incomeTaxDeducted,
-        cppContrib: parsed.cppContrib ?? prev.cppContrib,
-        eiPremium: parsed.eiPremium ?? prev.eiPremium,
-        quebecIncomeTaxDeducted:
-          parsed.quebecIncomeTaxDeducted ?? prev.quebecIncomeTaxDeducted,
-        rrqQpipContrib: parsed.rrqQpipContrib ?? prev.rrqQpipContrib,
+        employmentIncome: parsed.employmentIncome ?? "0",
+        incomeTaxDeducted: parsed.incomeTaxDeducted ?? "0",
+        cppContrib: parsed.cppContrib ?? "0",
+        eiPremium: parsed.eiPremium ?? "0",
+        quebecIncomeTaxDeducted: parsed.quebecIncomeTaxDeducted ?? "",
+        rrqQpipContrib: parsed.rrqQpipContrib ?? "0",
+        rqapContrib: parsed.rqapContrib ?? "0",
       }));
       setImportStatus(
         "OCR termine. Verifiez les champs detectes."
@@ -554,6 +723,13 @@ export default function Home() {
     if (isCalculating) {
       return;
     }
+    if (form.province === "qc" && !form.quebecIncomeTaxDeducted) {
+      setCalculateError(
+        "Veuillez saisir l'impot du Quebec retenu avant le calcul."
+      );
+      return;
+    }
+    setCalculateError(null);
     setIsCalculating(true);
     setTimeout(() => {
       setCalculatedResults(calculateTax(form));
@@ -584,9 +760,9 @@ export default function Home() {
             </a>
             <a className="btn ghost" href="#assumptions">
               Hypotheses
-            </a>
-          </div>
+          </a>
         </div>
+      </div>
       </header>
 
       <main>
@@ -627,6 +803,30 @@ export default function Home() {
                 </div>
                 {importStatus ? (
                   <p className="muted small">{importStatus}</p>
+                ) : null}
+                {importQuebecTax ? (
+                  <p className="muted small">
+                    Impot du Quebec retenu detecte: {importQuebecTax}
+                  </p>
+                ) : null}
+                {importPreviewText ? (
+                  <button
+                    className="btn ghost"
+                    type="button"
+                    onClick={() => setShowImportText((prev) => !prev)}
+                  >
+                    {showImportText
+                      ? "Masquer le texte importe"
+                      : "Voir le texte importe"}
+                  </button>
+                ) : null}
+                {showImportText && importPreviewText ? (
+                  <textarea
+                    className="field"
+                    readOnly
+                    value={importPreviewText}
+                    rows={6}
+                  />
                 ) : null}
               </div>
               <form className="card">
@@ -709,7 +909,7 @@ export default function Home() {
                       type="number"
                       name="quebecIncomeTaxDeducted"
                       min="0"
-                      step="50"
+                      step="0.01"
                       value={form.quebecIncomeTaxDeducted}
                       onChange={handleChange}
                       disabled={form.province !== "qc"}
@@ -735,7 +935,7 @@ export default function Home() {
                     </span>
                   </label>
                   <label className="field">
-                    <span>Releve 1 - Cotisations RRQ/QPIP</span>
+                    <span>Releve 1 - Cotisations RRQ</span>
                     <input
                       type="number"
                       name="rrqQpipContrib"
@@ -746,10 +946,25 @@ export default function Home() {
                       disabled={form.province !== "qc"}
                     />
                     <span className="muted small">
-                      Cotisations RRQ (T4 case 17 ou RL-1 case B) et QPIP.
+                      Cotisations RRQ (T4 case 17 ou RL-1 case B).
                     </span>
                   </label>
                 </div>
+                <label className="field">
+                  <span>Cotisation au RQAP (QPIP)</span>
+                  <input
+                    type="number"
+                    name="rqapContrib"
+                    min="0"
+                    step="0.01"
+                    value={form.rqapContrib}
+                    onChange={handleChange}
+                    disabled={form.province !== "qc"}
+                  />
+                  <span className="muted small">
+                    Cotisation au RQAP/QPIP indiquee sur le Releve 1 (case 10).
+                  </span>
+                </label>
                 <div className="two-col">
                   <label className="field">
                     <span>Boite 18 - Assurance-emploi</span>
@@ -842,6 +1057,9 @@ export default function Home() {
                     ? "Calcul en cours..."
                     : "Lancer le calcul"}
                 </button>
+                {calculateError ? (
+                  <span className="muted small">{calculateError}</span>
+                ) : null}
               </form>
             </div>
 
@@ -938,7 +1156,7 @@ export default function Home() {
                       : "Impot provincial non inclus."}
                   </span>
                 </div>
-              </div>
+      </div>
 
               <div className="card note">
                 <h3>Conseil rapide</h3>
@@ -1130,7 +1348,7 @@ export default function Home() {
           <p className="small muted">
             Concu pour demonstration. Aucune garantie de precision.
           </p>
-        </div>
+      </div>
       </footer>
     </>
   );
